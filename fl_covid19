@@ -1,0 +1,166 @@
+from torch.utils.data import Dataset
+import torch
+from torch import nn
+from torch import optim
+import random
+from collections import OrderedDict
+from torchvision import datasets,transforms,models
+
+def getData():
+    image_folder = "data"
+    input_size = 224
+    train_per = 0.7
+    batch_size = 32
+    transform=transforms.Compose([
+        transforms.Resize(255),
+        transforms.CenterCrop(input_size),
+        transforms.RandomHorizontalFlip(),  # randomly flip and rotate
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    full_data = datasets.ImageFolder(image_folder, transform=transform)
+    train_size = int(train_per * len(full_data))
+    val_size = len(full_data) - train_size
+    print(train_size, val_size)
+    train_set, val_set = torch.utils.data.random_split(full_data, [train_size, val_size])
+
+    train_data = torch.utils.data.DataLoader(train_set, batch_size=batch_size)
+    val_data = torch.utils.data.DataLoader(val_set, batch_size=batch_size)
+    return train_data, val_data
+
+
+class my_model():
+    def __init__(self, lr, epoch_num, num_workers, train_list, test_iter):
+        self.lr = lr
+        self.epoch_num = epoch_num
+        self.num_workers = num_workers
+        self.net = create_model().to(device)
+        self.train_list = train_list
+        self.test_iter = test_iter
+
+    def download_para(self, public_net_para):
+        self.net.load_state_dict(public_net_para)
+
+    def upload_para(self):
+        return self.net.state_dict()
+
+    def upload_minus_para(self, public_net_para):
+        para = self.para_minus(self.net.state_dict(), public_net_para)
+        return para
+
+    # 两个模型参数相减
+    def para_minus(self, para_a, para_b):
+        para = OrderedDict()
+        for name in para_a:
+            para[name] = para_a[name] - para_b[name]
+        return para
+
+    # 使用测试集对模型进行测试
+    def test(self, eopch, clinet):
+        correct, total = .0, .0
+        for inputs, labels in self.test_iter:
+            if device != 'cpu':
+                inputs = inputs.cuda()
+                labels = labels.cuda()
+            self.net.eval()
+            outputs = self.net(inputs)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum()
+        print('Epoch %d, Client %s, Net test accuracy = %.4f %%' % (eopch, clinet, 100 * float(correct) / total))
+        print('-' * 30)
+
+    def train(self):
+        # optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
+        optimizer = optim.SGD(self.net.parameters(), lr=0.001, momentum=0.9)
+        criterion = torch.nn.CrossEntropyLoss()
+        for epoch in range(self.epoch_num):
+            for step, (inputs, labels) in enumerate(iter(self.train_list)):
+                if device != 'cpu':
+                    inputs = inputs.cuda()
+                    labels = labels.cuda()
+                output = self.net(inputs)
+                loss = criterion(output, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+
+def create_model():
+    model = models.vgg16(pretrained=True)
+    for param in model.features.parameters():
+        param.requires_grad=False
+    n_inputs=model.classifier[6].in_features
+    model.classifier[6]=nn.Linear(n_inputs,2)
+    return model
+
+
+def list_segmentation(data_list, ceil_num):
+    # 将训练集平均分为x份
+    result = []
+    length = len(data_list)
+    step = int(length / ceil_num)
+    for i in range(0, length, step):
+        result.append(data_list[i: i + step])
+    return result[:-1]
+
+
+# 为每个客户端分配一份固定的数据
+def set_client_data(client_number, client_data_list):
+    result = {}
+    for i in range(client_number):
+        result[i] = client_data_list[i]
+    return result
+
+
+# 参数列表中所有参数的运算
+def para_list_operation(tensor_list, methond='add'):
+    assert len(tensor_list) >= 2, '客户端数量低于两个'
+    a = tensor_list[0]
+    if methond == 'add':
+        for i in tensor_list[1:]:
+            a += i
+    return a/len(tensor_list)
+
+
+def para_average(para_list, public_net_para):
+    net_total_num = len(para_list)
+    result = OrderedDict()
+    for name in para_list[0]:
+        # 2.对所有参数进行平均
+        para_sum_list = [para_list[net_num][name] for net_num in range(net_total_num)]
+        para_sum = para_list_operation(para_sum_list)
+        result[name] = public_net_para[name] + para_sum
+    return result
+
+
+def faderated_train():
+    train_loader, test_loader = getData()
+    public_net = my_model(lr=0.001, epoch_num=1, num_workers=2, train_list=[], test_iter=test_loader)
+    public_net_para = public_net.upload_para()
+
+    client_number = 20
+    select_number = 4
+    communication_rounds = 100
+    trainloader_list = list_segmentation(list(train_loader), client_number)
+    client_data_dic = set_client_data(client_number, trainloader_list)
+
+    for epoch in range(communication_rounds):
+        # 每轮训练从客户端随机选取select_number个参与训练
+        train_client_list = random.sample(list(range(client_number)), select_number)
+        # print('train_client_list: %s' % train_client_list)
+        net_para_list = []
+        for clinet in train_client_list:
+            clinet_net = my_model(lr=0.001, epoch_num=1, num_workers=2, train_list=client_data_dic[clinet], test_iter=test_loader)
+            clinet_net.download_para(public_net_para)
+            clinet_net.train()
+            net_para_list.append(clinet_net.upload_minus_para(public_net_para))
+
+        public_net_para = para_average(net_para_list, public_net_para)
+        public_net.download_para(public_net_para)
+        public_net.test(epoch, train_client_list)
+
+
+if __name__ == '__main__':
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    faderated_train()
